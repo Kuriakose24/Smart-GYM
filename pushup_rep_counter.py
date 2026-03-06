@@ -42,6 +42,28 @@ def calculate_angle(a,b,c):
 
 
 # -------------------------------
+# Accuracy calculation
+# -------------------------------
+
+def calculate_accuracy(elbow_angle, back_angle, hip_angle):
+
+    score = 0
+
+    if elbow_angle < 95:
+        score += 30
+
+    if back_angle > 130:
+        score += 30
+
+    if hip_angle > 130:
+        score += 30
+
+    score += 10  # stability buffer
+
+    return score
+
+
+# -------------------------------
 # Rep variables
 # -------------------------------
 
@@ -50,6 +72,9 @@ stage = "top"
 
 min_elbow = 180
 feedback = ""
+
+accuracy = 0
+posture = "Unknown"
 
 
 # -------------------------------
@@ -143,14 +168,23 @@ while cap.isOpened():
 
             stage = "bottom"
 
-            if hip_angle < 120:
-                feedback = "Hip sagging"
+            accuracy = calculate_accuracy(elbow_angle, back_angle, hip_angle)
 
-            elif back_angle < 120:
-                feedback = "Back bending"
+            if accuracy >= 70:
+                posture = "Correct"
+                feedback = "Good push-up"
 
             else:
-                feedback = "Good push-up"
+                posture = "Incorrect"
+
+                if hip_angle < 130:
+                    feedback = "Hip sagging"
+
+                elif back_angle < 130:
+                    feedback = "Back bending"
+
+                else:
+                    feedback = "Bad form"
 
 
         # -------------------------------
@@ -204,21 +238,41 @@ while cap.isOpened():
             2
         )
 
+        cv2.putText(
+            frame,
+            f"Accuracy: {accuracy}%",
+            (30,200),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255,255,0),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"Posture: {posture}",
+            (30,240),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0,255,255),
+            2
+        )
+
 
         # -------------------------------
         # Show debug angles
         # -------------------------------
 
         cv2.putText(frame, f"Elbow: {int(elbow_angle)}",
-                    (30,220), cv2.FONT_HERSHEY_SIMPLEX,
+                    (30,280), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (255,255,0), 2)
 
         cv2.putText(frame, f"Back: {int(back_angle)}",
-                    (30,250), cv2.FONT_HERSHEY_SIMPLEX,
+                    (30,310), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (255,255,0), 2)
 
         cv2.putText(frame, f"Hip: {int(hip_angle)}",
-                    (30,280), cv2.FONT_HERSHEY_SIMPLEX,
+                    (30,340), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (255,255,0), 2)
 
 
