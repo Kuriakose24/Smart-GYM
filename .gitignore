@@ -1,0 +1,5 @@
+dataset/
+*.zip
+*.mp4
+*.pkl
+venv/
