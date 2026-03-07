@@ -3,7 +3,7 @@ import numpy as np
 import mediapipe as mp
 import pandas as pd
 import joblib
-from collections import deque
+from collections import Counter
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -34,164 +34,134 @@ detector = vision.PoseLandmarker.create_from_options(options)
 # Angle calculation
 # --------------------------
 
-def calculate_angle(a,b,c):
+def calculate_angle(a, b, c):
 
-    a=np.array(a)
-    b=np.array(b)
-    c=np.array(c)
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
 
-    radians=np.arctan2(c[1]-b[1],c[0]-b[0]) - np.arctan2(a[1]-b[1],a[0]-b[0])
-    angle=np.abs(radians*180/np.pi)
+    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    angle = np.abs(radians*180/np.pi)
 
-    if angle>180:
-        angle=360-angle
+    if angle > 180:
+        angle = 360-angle
 
     return angle
-
-
-# --------------------------
-# Angle smoothing
-# --------------------------
-
-def smooth(prev,current,alpha=0.7):
-    return alpha*prev + (1-alpha)*current
 
 
 # --------------------------
 # Video input
 # --------------------------
 
-cap=cv2.VideoCapture("test_pushup.mp4")
+cap = cv2.VideoCapture("test_pushup.mp4")
 
-timestamp=0
+timestamp = 0
+stage = "top"
 
-prev_elbow=0
-prev_body=0
-
-prediction_buffer=deque(maxlen=8)
-
-stage="top"
-
+rep_predictions = []
+rep_count = 0
+rep_result = "Analyzing"
 
 print("Press Q to exit")
 
 
-# --------------------------
-# Main loop
-# --------------------------
-
 while cap.isOpened():
 
-    ret,frame=cap.read()
+    ret, frame = cap.read()
 
     if not ret:
+        print("Video finished or frame not read")
         break
 
-    h,w,_=frame.shape
+    h, w, _ = frame.shape
+    timestamp += 1
 
-    timestamp+=1
+    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-
-    image=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-
-    mp_image=mp.Image(
+    mp_image = mp.Image(
         image_format=mp.ImageFormat.SRGB,
         data=image
     )
 
-    result=detector.detect_for_video(mp_image,timestamp)
+    result = detector.detect_for_video(mp_image, timestamp)
 
 
     if result.pose_landmarks:
 
-        landmarks=result.pose_landmarks[0]
+        landmarks = result.pose_landmarks[0]
 
 
         def get_point(i):
-            return [landmarks[i].x,landmarks[i].y]
+            return [landmarks[i].x, landmarks[i].y]
 
 
-        shoulder=get_point(11)
-        elbow=get_point(13)
-        wrist=get_point(15)
+        shoulder = get_point(11)
+        elbow = get_point(13)
+        wrist = get_point(15)
 
-        hip=get_point(23)
-        knee=get_point(25)
-        ankle=get_point(27)
-
-        ear=get_point(7)
+        hip = get_point(23)
+        knee = get_point(25)
 
 
-        # --------------------------
-        # Calculate angles
-        # --------------------------
-
-        raw_elbow=calculate_angle(shoulder,elbow,wrist)
-
-        raw_body=calculate_angle(shoulder,hip,ankle)
-
-        hip_angle=calculate_angle(shoulder,hip,knee)
-
-        back_angle=calculate_angle(ear,shoulder,hip)
-
-
-        # --------------------------
-        # Smooth angles
-        # --------------------------
-
-        elbow_angle=smooth(prev_elbow,raw_elbow)
-
-        body_angle=smooth(prev_body,raw_body)
-
-        prev_elbow=elbow_angle
-        prev_body=body_angle
+        elbow_angle = calculate_angle(shoulder, elbow, wrist)
+        body_angle = calculate_angle(shoulder, hip, knee)
+        hip_angle = calculate_angle(shoulder, hip, knee)
 
 
         # --------------------------
         # Stage detection
         # --------------------------
 
-        if elbow_angle < 110:
-            stage="down"
+        if elbow_angle < 95:
+            stage = "down"
 
-        if elbow_angle > 150:
-            stage="top"
+        if elbow_angle > 150 and stage == "down":
 
+            # REP COMPLETED
 
-        posture="analyzing"
+            if len(rep_predictions) > 5:
+
+                rep_count += 1
+
+                majority = Counter(rep_predictions).most_common(1)[0][0]
+
+                rep_result = majority
+
+            rep_predictions = []
+            stage = "top"
 
 
         # --------------------------
-        # Only analyze bottom stage
+        # Frame prediction
         # --------------------------
 
-        if stage=="down":
+        if stage == "down" and elbow_angle < 90:
 
-            # biomechanical rule check
+            if body_angle < 135:
+                rule_prediction = "incorrect"
 
-            if body_angle < 150:
-                prediction="incorrect"
-
-            elif hip_angle < 140:
-                prediction="incorrect"
+            elif hip_angle < 130:
+                rule_prediction = "incorrect"
 
             else:
-
-                features=pd.DataFrame(
-                    [[elbow_angle,back_angle,hip_angle,body_angle]],
-                    columns=["elbow_angle","back_angle","hip_angle","knee_angle"]
-                )
-
-                prediction=model.predict(features)[0]
+                rule_prediction = "correct"
 
 
-            prediction_buffer.append(prediction)
+            features = pd.DataFrame(
+                [[elbow_angle, 0, hip_angle, body_angle]],
+                columns=["elbow_angle", "back_angle", "hip_angle", "knee_angle"]
+            )
+
+            ml_prediction = model.predict(features)[0]
 
 
-            # frame voting
+            if rule_prediction == "correct" and ml_prediction == "correct":
+                prediction = "correct"
+            else:
+                prediction = "incorrect"
 
-            posture=max(set(prediction_buffer),
-                        key=prediction_buffer.count)
+
+            rep_predictions.append(prediction)
 
 
         # --------------------------
@@ -200,42 +170,46 @@ while cap.isOpened():
 
         for lm in landmarks:
 
-            x=int(lm.x*w)
-            y=int(lm.y*h)
+            x = int(lm.x * w)
+            y = int(lm.y * h)
 
-            cv2.circle(frame,(x,y),3,(0,255,0),-1)
+            cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
 
 
         # --------------------------
-        # Display info
+        # Display information
         # --------------------------
 
-        cv2.putText(frame,f"Stage: {stage}",
-                    (30,60),
+        cv2.putText(frame, f"Reps: {rep_count}",
+                    (30, 50),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1,(255,0,0),2)
+                    1, (255, 0, 0), 2)
 
-        cv2.putText(frame,f"Posture: {posture}",
-                    (30,100),
+        cv2.putText(frame, f"Last Rep: {rep_result}",
+                    (30, 90),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1,(0,0,255),2)
+                    1, (0, 0, 255), 2)
 
-
-        cv2.putText(frame,f"Elbow:{int(elbow_angle)}",
-                    (30,160),
+        cv2.putText(frame, f"Elbow: {int(elbow_angle)}",
+                    (30, 140),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,(255,255,255),2)
+                    0.7, (255, 255, 255), 2)
 
-        cv2.putText(frame,f"Body:{int(body_angle)}",
-                    (30,190),
+        cv2.putText(frame, f"Body: {int(body_angle)}",
+                    (30, 170),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,(255,255,255),2)
+                    0.7, (255, 255, 255), 2)
+
+        cv2.putText(frame, f"Hip: {int(hip_angle)}",
+                    (30, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255, 255, 255), 2)
 
 
-    cv2.imshow("Stable Pushup Analysis",frame)
+    cv2.imshow("Smart Gym Pushup Detection", frame)
 
 
-    if cv2.waitKey(1)&0xFF==ord('q'):
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 
