@@ -9,7 +9,7 @@ import joblib
 # Load dataset
 # ----------------------------
 
-df = pd.read_csv("pushup_image_dataset_balanced.csv")
+pd.read_csv("datasets/pushup_image_dataset_balanced.csv")
 
 X = df[["elbow_angle","back_angle","hip_angle","knee_angle"]]
 y = df["label"]

@@ -3,8 +3,6 @@ import numpy as np
 import mediapipe as mp
 import pandas as pd
 import joblib
-import csv
-from datetime import datetime
 from collections import Counter
 
 from mediapipe.tasks import python
@@ -52,32 +50,38 @@ def calculate_angle(a,b,c):
 
 
 # --------------------------
-# Video input
+# Angle smoothing
 # --------------------------
 
-cap=cv2.VideoCapture(0)
+def smooth(prev,current,alpha=0.7):
+    return alpha*prev + (1-alpha)*current
+
+
+prev_elbow = 0
+prev_body = 0
+
+
+# --------------------------
+# Camera input
+# --------------------------
+
+cap = cv2.VideoCapture("tests/test_pushup1.mp4")
 
 timestamp=0
-
 stage="top"
 
 rep_predictions=[]
 
 rep_count=0
-
 correct_reps=0
 incorrect_reps=0
 
+feedback=""
 rep_result="Analyzing"
 
-feedback=""
 
 print("Press Q to exit")
 
-
-# --------------------------
-# Main loop
-# --------------------------
 
 while cap.isOpened():
 
@@ -118,23 +122,30 @@ while cap.isOpened():
         knee=get_point(25)
 
 
-        elbow_angle=calculate_angle(shoulder,elbow,wrist)
+        # raw angles
 
-        body_angle=calculate_angle(shoulder,hip,knee)
-
+        raw_elbow=calculate_angle(shoulder,elbow,wrist)
+        raw_body=calculate_angle(shoulder,hip,knee)
         hip_angle=calculate_angle(shoulder,hip,knee)
+
+
+        # smoothing
+
+        elbow_angle=smooth(prev_elbow,raw_elbow)
+        body_angle=smooth(prev_body,raw_body)
+
+        prev_elbow=elbow_angle
+        prev_body=body_angle
 
 
         # --------------------------
         # Stage detection
         # --------------------------
 
-        if elbow_angle < 95:
+        if elbow_angle < 110:
             stage="down"
 
-        if elbow_angle > 150 and stage=="down":
-
-            # REP COMPLETED
+        if elbow_angle > 160 and stage=="down":
 
             if len(rep_predictions) > 5:
 
@@ -150,30 +161,24 @@ while cap.isOpened():
                     incorrect_reps+=1
 
             rep_predictions=[]
-
             stage="top"
 
 
         # --------------------------
-        # Frame prediction
+        # Frame analysis
         # --------------------------
 
-        if stage=="down" and elbow_angle < 90:
+        if stage=="down" and elbow_angle < 100:
 
             if body_angle < 135:
 
                 rule_prediction="incorrect"
-                feedback="Keep your body straight"
+                feedback="Keep body straight"
 
             elif hip_angle < 130:
 
                 rule_prediction="incorrect"
                 feedback="Do not bend hips"
-
-            elif elbow_angle > 100:
-
-                rule_prediction="incorrect"
-                feedback="Go lower"
 
             else:
 
@@ -211,57 +216,35 @@ while cap.isOpened():
 
 
         # --------------------------
-        # Display info
+        # Display
         # --------------------------
 
-        cv2.putText(frame,f"Total Reps: {rep_count}",
+        cv2.putText(frame,f"Reps: {rep_count}",
                     (30,40),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1,(255,0,0),2)
 
-        cv2.putText(frame,f"Correct Reps: {correct_reps}",
+        cv2.putText(frame,f"Correct: {correct_reps}",
                     (30,80),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,(0,255,0),2)
 
-        cv2.putText(frame,f"Incorrect Reps: {incorrect_reps}",
+        cv2.putText(frame,f"Incorrect: {incorrect_reps}",
                     (30,110),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,(0,0,255),2)
 
-        cv2.putText(frame,f"Last Rep: {rep_result}",
-                    (30,150),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,(255,255,0),2)
-
         cv2.putText(frame,f"Feedback: {feedback}",
-                    (30,190),
+                    (30,150),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,(255,255,255),2)
 
 
-    cv2.imshow("Smart Gym Pushup Detection",frame)
+    cv2.imshow("Smart Gym Pushup Real-Time",frame)
 
 
     if cv2.waitKey(1)&0xFF==ord('q'):
         break
-
-
-# --------------------------
-# Save workout summary
-# --------------------------
-
-with open("workout_log.csv","a",newline="") as file:
-
-    writer=csv.writer(file)
-
-    writer.writerow([
-        "pushup",
-        rep_count,
-        correct_reps,
-        incorrect_reps,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ])
 
 
 cap.release()
