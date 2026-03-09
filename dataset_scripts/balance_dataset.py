@@ -1,19 +1,21 @@
 import pandas as pd
 
-df = pd.read_csv("pushup_image_dataset_clean.csv")
+
+df = pd.read_csv("datasets/squat_image_dataset.csv")
 
 correct = df[df["label"] == "correct"]
 incorrect = df[df["label"] == "incorrect"]
 
-# match counts
-correct_sample = correct.sample(len(incorrect), random_state=42)
+min_count = min(len(correct), len(incorrect))
 
-balanced_df = pd.concat([correct_sample, incorrect])
+correct_sample = correct.sample(min_count, random_state=42)
+incorrect_sample = incorrect.sample(min_count, random_state=42)
 
-print("Balanced dataset size:", len(balanced_df))
-print("\nLabel counts:")
+balanced_df = pd.concat([correct_sample, incorrect_sample])
+
+balanced_df = balanced_df.sample(frac=1).reset_index(drop=True)
+
+balanced_df.to_csv("datasets/squat_image_dataset_balanced.csv", index=False)
+
+print("Balanced dataset created")
 print(balanced_df["label"].value_counts())
-
-balanced_df.to_csv("pushup_image_dataset_balanced.csv", index=False)
-
-print("\nBalanced dataset saved")

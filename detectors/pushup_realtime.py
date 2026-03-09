@@ -1,23 +1,30 @@
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import cv2
 import numpy as np
-import mediapipe as mp
 import pandas as pd
 import joblib
+import mediapipe as mp
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+from utils.feedback_engine import FeedbackEngine
 
-# --------------------------
+
+# -----------------------------
 # Load ML Model
-# --------------------------
+# -----------------------------
 
 model = joblib.load("models/pushup_final_model.pkl")
 
 
-# --------------------------
+# -----------------------------
 # Pose Detector
-# --------------------------
+# -----------------------------
 
 base_options = python.BaseOptions(
     model_asset_path="models/pose_landmarker.task"
@@ -31,9 +38,17 @@ options = vision.PoseLandmarkerOptions(
 detector = vision.PoseLandmarker.create_from_options(options)
 
 
-# --------------------------
+# -----------------------------
+# Rep Thresholds
+# -----------------------------
+
+BOTTOM_THRESHOLD = 120
+TOP_THRESHOLD = 135
+
+
+# -----------------------------
 # Angle Calculation
-# --------------------------
+# -----------------------------
 
 def calculate_angle(a,b,c):
 
@@ -50,9 +65,25 @@ def calculate_angle(a,b,c):
     return angle
 
 
-# --------------------------
+# -----------------------------
+# Angle Smoothing
+# -----------------------------
+
+def smooth(prev,current,alpha=0.7):
+
+    return alpha*prev + (1-alpha)*current
+
+
+# -----------------------------
+# Feedback Engine
+# -----------------------------
+
+feedback_engine = FeedbackEngine()
+
+
+# -----------------------------
 # Camera
-# --------------------------
+# -----------------------------
 
 cap=cv2.VideoCapture(0)
 
@@ -63,11 +94,32 @@ correct_reps=0
 incorrect_reps=0
 
 stage="UP"
-
 feedback="Stand in pushup position"
+
+bottom_reached=False
+exercise_started=False
+
+
+# bottom posture storage
+bottom_elbow=0
+bottom_body=0
+bottom_hip=0
+bottom_back=0
+
+
+# smoothing memory
+prev_elbow=0
+prev_body=0
+prev_hip=0
+prev_back=0
+
 
 print("Press Q to exit")
 
+
+# -----------------------------
+# Main Loop
+# -----------------------------
 
 while cap.isOpened():
 
@@ -106,87 +158,162 @@ while cap.isOpened():
         ear=get_point(7)
 
 
-        # --------------------------
-        # Angle Calculations
-        # --------------------------
+        # -----------------------------
+        # Raw Angles
+        # -----------------------------
 
-        elbow_angle=calculate_angle(shoulder,elbow,wrist)
-        body_angle=calculate_angle(shoulder,hip,ankle)
-        hip_angle=calculate_angle(shoulder,hip,knee)
-        back_angle=calculate_angle(ear,shoulder,hip)
+        raw_elbow=calculate_angle(shoulder,elbow,wrist)
+        raw_body=calculate_angle(shoulder,hip,ankle)
+        raw_hip=calculate_angle(shoulder,hip,knee)
+        raw_back=calculate_angle(ear,shoulder,hip)
 
 
-        # --------------------------
+        # -----------------------------
+        # Smooth Angles
+        # -----------------------------
+
+        elbow_angle=smooth(prev_elbow,raw_elbow)
+        body_angle=smooth(prev_body,raw_body)
+        hip_angle=smooth(prev_hip,raw_hip)
+        back_angle=smooth(prev_back,raw_back)
+
+        prev_elbow=elbow_angle
+        prev_body=body_angle
+        prev_hip=hip_angle
+        prev_back=back_angle
+
+
+        # -----------------------------
         # Orientation Filter
-        # --------------------------
+        # -----------------------------
 
         horizontal_body = abs(shoulder[1] - hip[1]) < 0.20
 
 
-        if horizontal_body:
+        # -----------------------------
+        # Detect Pushup Start
+        # -----------------------------
 
-            # DOWN position
-            if elbow_angle < 95:
+        if horizontal_body and elbow_angle > 160 and not exercise_started:
+
+            exercise_started=True
+            feedback="Pushup position detected"
+
+
+        # -----------------------------
+        # Rep Detection
+        # -----------------------------
+
+        if horizontal_body and exercise_started:
+
+            if elbow_angle < BOTTOM_THRESHOLD + 5:
 
                 stage="DOWN"
+                bottom_reached=True
+
+                bottom_elbow = elbow_angle
+                bottom_body = body_angle
+                bottom_hip = hip_angle
+                bottom_back = back_angle
 
 
-            # REP COMPLETE
-            if elbow_angle > 150 and stage=="DOWN":
+            if elbow_angle > TOP_THRESHOLD and stage=="DOWN" and bottom_reached:
 
                 stage="UP"
+                bottom_reached=False
+
                 rep_count+=1
 
 
-                # --------------------------
+                # -----------------------------
                 # ML Prediction
-                # --------------------------
+                # -----------------------------
 
                 features=pd.DataFrame(
-                    [[elbow_angle,back_angle,hip_angle,body_angle]],
-                    columns=["elbow_angle","back_angle","hip_angle","knee_angle"]
+                    [[bottom_elbow,bottom_back,bottom_hip,bottom_body]],
+                    columns=[
+                        "elbow_angle",
+                        "back_angle",
+                        "hip_angle",
+                        "knee_angle"
+                    ]
                 )
 
                 prediction=model.predict(features)[0]
 
 
-                # --------------------------
-                # Feedback Engine
-                # --------------------------
+                # -----------------------------
+                # Rule Override
+                # -----------------------------
+
+                rule_violation=False
+
+                # hips too high
+                if bottom_body < 150 and bottom_hip < 160:
+                    prediction="incorrect"
+                    feedback="Hips too high"
+                    rule_violation=True
+
+                # hips sagging
+                elif bottom_body < 150 and bottom_hip > 160:
+                    prediction="incorrect"
+                    feedback="Hips sagging"
+                    rule_violation=True
+
+                # not going low enough
+                elif bottom_elbow > 115:
+                    prediction="incorrect"
+                    feedback="Go lower"
+                    rule_violation=True
+
+
+                # -----------------------------
+                # Rep Score
+                # -----------------------------
+
+                score=feedback_engine.calculate_rep_score(
+                    bottom_elbow,
+                    bottom_body,
+                    bottom_hip,
+                    bottom_back
+                )
+
+                feedback_engine.add_rep_score(score)
+
+
+                # -----------------------------
+                # Final Feedback
+                # -----------------------------
 
                 if prediction=="correct":
 
                     correct_reps+=1
-                    feedback="Good form"
+                    feedback="Perfect Rep"
 
                 else:
 
                     incorrect_reps+=1
 
-                    if body_angle < 140:
-                        feedback="Hips sagging"
+                    if not rule_violation:
+                        feedback=feedback_engine.generate_feedback(
+                            bottom_elbow,
+                            bottom_body,
+                            bottom_hip,
+                            bottom_back
+                        )
 
-                    elif body_angle > 210:
-                        feedback="Hips too high"
-
-                    elif elbow_angle > 100:
-                        feedback="Lower your body"
-
-                    elif back_angle < 120:
-                        feedback="Keep back straight"
-
-                    else:
-                        feedback="Incorrect posture"
 
         else:
 
-            feedback="Stand in pushup position"
+            if not exercise_started:
+                feedback="Get into pushup position"
+
             stage="UP"
 
 
-        # --------------------------
+        # -----------------------------
         # Draw Landmarks
-        # --------------------------
+        # -----------------------------
 
         for lm in landmarks:
 
@@ -196,35 +323,49 @@ while cap.isOpened():
             cv2.circle(frame,(x,y),3,(0,255,0),-1)
 
 
-        # --------------------------
+        # -----------------------------
+        # Debug Angles
+        # -----------------------------
+
+        cv2.putText(frame,f"Body:{int(body_angle)}",(30,200),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+
+        cv2.putText(frame,f"Hip:{int(hip_angle)}",(30,230),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+
+
+        # -----------------------------
         # Display
-        # --------------------------
+        # -----------------------------
 
-        cv2.putText(frame,f"Reps: {rep_count}",
-                    (30,40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,(255,0,0),2)
+        cv2.putText(frame,f"Reps: {rep_count}",(30,40),
+                    cv2.FONT_HERSHEY_SIMPLEX,1,(255,0,0),2)
 
-        cv2.putText(frame,f"Correct: {correct_reps}",
-                    (30,80),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,(0,255,0),2)
+        cv2.putText(frame,f"Correct: {correct_reps}",(30,80),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,255,0),2)
 
-        cv2.putText(frame,f"Incorrect: {incorrect_reps}",
-                    (30,110),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,(0,0,255),2)
+        cv2.putText(frame,f"Incorrect: {incorrect_reps}",(30,110),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255),2)
 
-        cv2.putText(frame,f"Feedback: {feedback}",
-                    (30,150),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,(255,255,255),2)
+        cv2.putText(frame,f"Feedback: {feedback}",(30,150),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.8,(255,255,255),2)
 
 
-    cv2.imshow("Smart Gym Pushup Feedback System",frame)
+    cv2.imshow("Smart Gym Pushup Engine",frame)
 
     if cv2.waitKey(1)&0xFF==ord('q'):
         break
+
+
+summary=feedback_engine.workout_summary()
+
+print("\nWorkout Summary")
+print(summary)
+
+if summary["trainer_alert"]:
+    print("Trainer Alert: Posture improvement needed")
+else:
+    print("Perfect Workout")
 
 
 cap.release()
