@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 .env
 attendance/*.csv
+smart_gym/.env
