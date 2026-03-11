@@ -221,6 +221,13 @@ def main():
     session_ids    = {}              # { "Kevin_pushup": session_id }
     snapshot_count = 0
 
+    # FIX: Track per-session stats independently of the RepCounter object.
+    # RepCounter.best_depth resets when exercise switches, so we can't read
+    # it at shutdown — it will always be 180.0 for any session that ended early.
+    # Instead we update these dicts on every rep_completed event.
+    # { "Kevin_pushup": {"rep_count": 3, "best_depth": 66.0, "total_depth": 198.0} }
+    session_stats  = {}
+
     # ── Main loop ─────────────────────────────────────────────────
     while True:
         ret, frame = cam.read()
@@ -321,19 +328,34 @@ def main():
                 if person.get("rep_completed") and sess_key in session_ids:
                     counter = rep_mgr.counters.get(name)
                     if counter:
+                        # FIX: Update session_stats NOW while counter still has
+                        # correct values — don't wait until shutdown when they
+                        # may have been reset by an exercise switch.
+                        st = session_stats.setdefault(sess_key, {
+                            "rep_count":   0,
+                            "best_depth":  180.0,
+                            "total_depth": 0.0,
+                        })
+                        st["rep_count"] += 1
+                        depth_key = "elbow" if exercise == "pushup" else "knee"
+                        rep_depth = person.get("bottom_angles", {}).get(depth_key, 180.0) or 180.0
+                        if rep_depth < st["best_depth"]:
+                            st["best_depth"] = rep_depth
+                        st["total_depth"] += rep_depth
+
                         db.log_rep(
                             session_id = session_ids[sess_key],
                             name       = name,
                             exercise   = exercise,
-                            rep_number = counter.rep_count,
+                            rep_number = st["rep_count"],   # per-session rep number
                             angles     = person.get("bottom_angles", {}),
-                            form_score = None,  # ML model plugs in here
+                            form_score = None,               # ML model plugs in here
                         )
                         db.update_session_reps(
                             session_id = session_ids[sess_key],
-                            rep_count  = counter.rep_count,
-                            best_depth = counter.best_depth,
-                            avg_depth  = counter.get_avg_depth(),
+                            rep_count  = st["rep_count"],
+                            best_depth = st["best_depth"],
+                            avg_depth  = st["total_depth"] / st["rep_count"],
                         )
 
         # 8. Draw overlay
@@ -358,15 +380,19 @@ def main():
     # End all active sessions in DB
     if db:
         for sess_key, sid in session_ids.items():
-            name, exercise = sess_key.rsplit("_", 1)
-            counter = rep_mgr.counters.get(name)
-            if counter:
-                db.end_session(
-                    sid,
-                    rep_count  = counter.rep_count,
-                    best_depth = counter.best_depth,
-                    avg_depth  = counter.get_avg_depth(),
-                )
+            # FIX: Use session_stats (updated live per rep) instead of
+            # counter object (which resets best_depth on exercise switch).
+            st = session_stats.get(sess_key, {})
+            rep_count  = st.get("rep_count",   0)
+            best_depth = st.get("best_depth",  180.0)
+            total      = st.get("total_depth", 0.0)
+            avg_depth  = (total / rep_count) if rep_count > 0 else 0.0
+            db.end_session(
+                sid,
+                rep_count  = rep_count,
+                best_depth = best_depth,
+                avg_depth  = avg_depth,
+            )
 
     cam.stop()
     cv2.destroyAllWindows()
@@ -379,11 +405,19 @@ def main():
     if summary:
         for key, stats in summary.items():
             per_ex = stats.get("per_exercise_reps", {})
-            breakdown = "  ".join(
-                f"{ex}: {count}" for ex, count in per_ex.items()
-            ) or f"{stats['exercise']}: {stats['reps']}"
-            print(f"  {stats['name']:12} | Total: {stats['reps']} reps  ({breakdown})  "
-                  f"| best depth: {stats['best_depth']}°")
+            # Build per-exercise breakdown with depth from session_stats
+            lines = []
+            for ex, count in per_ex.items():
+                sk = f"{stats['name']}_{ex}"
+                st = session_stats.get(sk, {})
+                bd = st.get("best_depth", 0.0)
+                av = (st["total_depth"] / st["rep_count"]) if st.get("rep_count") else 0.0
+                lines.append(f"{ex}: {count} reps  best={bd:.0f}°  avg={av:.0f}°")
+            if not lines:
+                lines = [f"{stats['exercise']}: {stats['reps']} reps"]
+            print(f"  {stats['name']:12} | Total: {stats['reps']} reps")
+            for line in lines:
+                print(f"    {line}")
     else:
         print("  No exercise data recorded.")
 
