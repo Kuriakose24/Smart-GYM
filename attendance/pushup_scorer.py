@@ -86,4 +86,4 @@ class PushupScorer:
             "incorrect_reps": self.incorrect_reps,
             "average_score":  ws["average_score"],
             "trainer_alert":  ws["trainer_alert"]
-        }
+        } 
