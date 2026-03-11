@@ -3,3 +3,9 @@ dataset/
 *.mp4
 *.pkl
 venv/
+
+smart_gym/faces/
+__pycache__/
+*.pyc
+.env
+attendance/*.csv
