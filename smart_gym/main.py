@@ -85,7 +85,10 @@ def draw_person(frame, person):
     
     name     = person.get("name",     "Unknown")
     exercise = person.get("exercise", "unknown")
-    reps     = person.get("rep_count", 0)
+    reps     = person.get("rep_count", 0)  # total reps across all exercises
+    # Show per-exercise reps on screen if available, otherwise total
+    counter_obj = None
+    per_ex_reps = reps  # default to total
     stage    = person.get("stage",    "UP")
     feedback = person.get("feedback", "")
     angles   = person.get("angles")  or {}
@@ -116,8 +119,8 @@ def draw_person(frame, person):
                 (x1 + 4, y1 - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-    # Exercise + stage tag
-    tag = f"{exercise.upper()} | {stage}"
+    # Exercise + stage tag — show current exercise rep count separately
+    tag = f"{exercise.upper()} | {stage}  [Total:{reps}]"
     cv2.putText(frame, tag,
                 (x1, y2 + 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
@@ -375,9 +378,12 @@ def main():
     summary = rep_mgr.get_summary()
     if summary:
         for key, stats in summary.items():
-            print(f"  {stats['name']:12} | {stats['exercise']:8} | "
-                  f"{stats['reps']} reps | "
-                  f"best depth: {stats['best_depth']}°")
+            per_ex = stats.get("per_exercise_reps", {})
+            breakdown = "  ".join(
+                f"{ex}: {count}" for ex, count in per_ex.items()
+            ) or f"{stats['exercise']}: {stats['reps']}"
+            print(f"  {stats['name']:12} | Total: {stats['reps']} reps  ({breakdown})  "
+                  f"| best depth: {stats['best_depth']}°")
     else:
         print("  No exercise data recorded.")
 

@@ -94,7 +94,7 @@ class RepCounter:
     """
 
     HYSTERESIS       = 5.0   # degrees of hysteresis to prevent stage flickering
-    MIN_DOWN_FRAMES  = 5     # FIX: was 2, now 5 — must hold bottom to count
+    MIN_DOWN_FRAMES  = 3     # lowered from 5 → catches first rep of each set faster
     
     # Body angle thresholds for validation
     PUSHUP_MIN_BODY_ANGLE = 40.0   # body must be at least 40° from vertical
@@ -118,6 +118,9 @@ class RepCounter:
         self.best_depth    = 180.0   # lowest angle seen (lower = deeper rep)
         self.total_depth   = 0.0
         self.last_rep_time = None
+        # Per-exercise rep counts — { "pushup": 3, "squat": 5 }
+        # Lets the summary show a breakdown rather than just total
+        self.per_exercise_reps = {}
 
         print(f"[RepCounter] Created for '{name}' — {exercise}")
 
@@ -248,9 +251,11 @@ class RepCounter:
         self.total_depth  += self.bottom_angles.get(
             "elbow" if self.exercise == "pushup" else "knee", 0
         )
+        # Track per-exercise rep count for summary breakdown
+        self.per_exercise_reps[self.exercise] = self.per_exercise_reps.get(self.exercise, 0) + 1
         self.feedback = f"Rep {self.rep_count} done!"
         print(f"[RepCounter] ✅ {self.name} — Rep {self.rep_count} "
-              f"({self.exercise})  depth={self.best_depth:.0f}°")
+              f"({self.exercise} #{self.per_exercise_reps[self.exercise]})  depth={self.best_depth:.0f}°")
 
     def get_avg_depth(self):
         if self.rep_count == 0:
@@ -258,7 +263,10 @@ class RepCounter:
         return self.total_depth / self.rep_count
 
     def switch_exercise(self, exercise):
-        """Switch to a different exercise. Keeps rep count."""
+        """
+        Switch to a different exercise.
+        Keeps total rep_count climbing but resets best_depth for the new exercise.
+        """
         if exercise == self.exercise:
             return
         self.exercise     = exercise
@@ -266,19 +274,22 @@ class RepCounter:
         self.feedback     = "Ready — start your exercise!"
         self._down_frames = 0
         self._cooldown    = 0
+        self.best_depth   = 180.0   # reset so best depth is per-exercise, not lifetime
+        self.total_depth  = 0.0     # reset avg depth tracking for new exercise
         self._elbow_smoother.reset()
         self._knee_smoother.reset()
         print(f"[RepCounter] {self.name} switched to {exercise}")
 
     def get_stats(self):
         return {
-            "name":       self.name,
-            "exercise":   self.exercise,
-            "reps":       self.rep_count,
-            "stage":      self.stage,
-            "feedback":   self.feedback,
-            "best_depth": round(self.best_depth, 1),
-            "avg_depth":  round(self.get_avg_depth(), 1),
+            "name":              self.name,
+            "exercise":          self.exercise,
+            "reps":              self.rep_count,           # total across all exercises
+            "per_exercise_reps": dict(self.per_exercise_reps),  # e.g. {"squat": 3, "pushup": 2}
+            "stage":             self.stage,
+            "feedback":          self.feedback,
+            "best_depth":        round(self.best_depth, 1),
+            "avg_depth":         round(self.get_avg_depth(), 1),
         }
 
 
