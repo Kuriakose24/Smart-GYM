@@ -1,31 +1,20 @@
 """
-main.py — SmartGym AI  (v2 — full integration fix)
-----------------------------------------------------
-FIXES vs v1:
+main.py — SmartGym AI  (v3 — ML model integrated + first-rep fix)
+------------------------------------------------------------------
+CHANGES vs v2:
 
-FIX 1 — Pipeline order was correct but angles were attached BEFORE identity
-    OLD order:  track → identity → angles → exercise → reps  ✓ (correct)
-    This was actually fine in the original. Left as-is.
+FIX 1 — First-rep miss fixed in ExerciseDetector (v8) + RepCounter (v6)
+    ExerciseDetector ENTER_N reduced 8 → 3 so exercise is confirmed
+    in ~0.2s instead of ~0.5s, ensuring the RepCounter is live before
+    the first DOWN phase of rep 1 completes.
+    RepCounter MIN_DOWN_FRAMES reduced 2 → 1 for the same reason.
 
-FIX 2 — AttendanceTracker and DBHandler are optional / may not exist
-    Old code crashed on startup if attendance/ or database/ modules were
-    absent (common when running your half of the project standalone).
-    FIX: Both wrapped in try/except with graceful None fallback.
-    The pipeline runs fully without them.
+FIX 2 — ML model predictions shown on screen
+    RepCounter v6 runs pushup_final_model / squat_final_model on each rep.
+    draw_person() now shows prediction (correct/incorrect) and form_score.
 
-FIX 3 — Exercise switch double-notification removed
-    Old code notified rep_manager of exercise switches in TWO places:
-      (a) inside ExerciseDetectorManager.update() via rep_manager ref
-      (b) again in the main loop after ex_det.update()
-    This caused switch_exercise() to be called twice on the same frame,
-    resetting the smoother and best_depth unnecessarily.
-    FIX: Removed the redundant main-loop notification. The ExerciseDetector-
-    Manager already handles it internally via its rep_manager reference.
-
-FIX 4 — draw_person shows per-exercise rep count, not just total
-    OLD: always showed counter.rep_count (lifetime total across all exercises)
-    FIX: Shows per_exercise_reps[exercise] for the current exercise type,
-    with the lifetime total in smaller text below.
+FIX 3 — form_score logged to database
+    db.log_rep() now receives the form_score from RepCounter.
 
 Pipeline every frame:
     1. VideoStream        → raw BGR frame
@@ -33,8 +22,8 @@ Pipeline every frame:
     3. IdentityLinker     → FaceNet identifies each person (adds name, score)
     4. Attendance         → marks CSV/DB once per person per day [optional]
     5. PoseEstimator      → extracts joint angles from keypoints
-    6. ExerciseDetector   → auto-detects pushup / squat / standing
-    7. RepCounter         → counts reps per person (tied to name)
+    6. ExerciseDetector   → auto-detects pushup / squat / standing (v8)
+    7. RepCounter         → counts reps + ML form prediction (v6)
     8. Database           → logs reps + form scores [optional]
     9. Display            → draws overlay on frame
 
@@ -46,25 +35,20 @@ Controls:
     P        — force pushup mode for all
     K        — force squat mode for all
 """
-
-import sys
-import os
-import cv2
-import time
-import warnings
-warnings.filterwarnings("ignore")
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
+import sys, os, cv2, time, warnings
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))  # smart_gym/ is root
 import config
-from camera.video_stream         import VideoStream
-from tracking.person_tracker     import PersonTracker
-from identity.identity_linker    import IdentityLinker
-from pose.pose_estimator         import PoseEstimator
-from exercise.exercise_detector  import ExerciseDetectorManager
-from exercise.rep_counter        import RepCounterManager
 
-# Optional modules — system works without them
+from camera.video_stream          import VideoStream
+from tracking.person_tracker      import PersonTracker
+from identity.identity_linker     import IdentityLinker
+from pose.pose_estimator          import PoseEstimator
+from exercise.exercise_detector   import ExerciseDetectorManager
+from exercise.rep_counter         import RepCounterManager
+from attendance.attendance_tracker import AttendanceTracker
+from database.db_handler          import DBHandler
+
+# Optional modules
 AttendanceTracker = None
 DBHandler         = None
 
@@ -83,11 +67,13 @@ except ImportError:
 
 # ── Display constants ─────────────────────────────────────────────────────────
 COLORS = {
-    "pushup":   (0, 165, 255),    # orange
-    "squat":    (255, 0, 255),    # magenta
-    "standing": (0, 255, 0),      # green
-    "unknown":  (100, 100, 100),  # gray
+    "pushup":   (0, 165, 255),
+    "squat":    (255, 0, 255),
+    "standing": (0, 255, 0),
+    "unknown":  (100, 100, 100),
     "name_bg":  (20, 20, 20),
+    "correct":  (0, 220, 0),
+    "incorrect":(0, 60, 255),
 }
 
 SKELETON = [
@@ -107,35 +93,50 @@ SKELETON = [
 
 
 def draw_person(frame, person, rep_manager=None):
-    """Draw bounding box, skeleton, name, reps, and feedback for one person."""
+    """Draw bounding box, skeleton, name, reps, per-rep feedback."""
     x1, y1, x2, y2 = person["box"]
     h, w = frame.shape[:2]
 
-    # Clamp coordinates inside frame
     x1 = int(max(0, x1));  y1 = int(max(0, y1))
     x2 = int(min(w, x2));  y2 = int(min(h, y2))
     if x1 >= x2 or y1 >= y2:
         return
 
-    name     = person.get("name",     "Unknown")
-    exercise = person.get("exercise", "unknown")
-    reps     = person.get("rep_count", 0)      # lifetime total
-    stage    = person.get("stage",    "UP")
-    feedback = person.get("feedback", "")
-    angles   = person.get("angles")   or {}
-    color    = COLORS.get(exercise, COLORS["unknown"])
+    name             = person.get("name",             "Unknown")
+    exercise         = person.get("exercise",          "unknown")
+    reps             = person.get("rep_count",         0)
+    correct          = person.get("correct_reps",      0)
+    incorrect        = person.get("incorrect_reps",    0)
+    accuracy         = person.get("form_accuracy",     None)
+    stage            = person.get("stage",             "UP")
+    feedback         = person.get("feedback",          "")
+    last_form_fb     = person.get("last_form_feedback","")
+    last_form_sev    = person.get("last_form_severity","good")
+    angles           = person.get("angles")           or {}
+    prediction       = person.get("last_prediction")
+    form_score       = person.get("form_score")
+    trainer_alert    = person.get("trainer_alert",     False)
+    color            = COLORS.get(exercise, COLORS["unknown"])
 
-    # FIX: show current-exercise rep count (e.g. pushup:3), not just lifetime total
+    # Severity → colour mapping
+    SEV_COLORS = {
+        "good":    COLORS["correct"],    # green
+        "warning": (0, 165, 255),        # orange
+        "error":   COLORS["incorrect"],  # red
+    }
+
+    # Per-exercise rep count
     per_ex_reps = reps
     if rep_manager and name != "Unknown":
         counter = rep_manager.counters.get(name)
         if counter:
             per_ex_reps = counter.per_exercise_reps.get(exercise, 0)
 
-    # Bounding box
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    # Bounding box — red if trainer alert
+    box_color = (0, 0, 220) if trainer_alert else color
+    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
 
-    # Skeleton lines
+    # Skeleton
     kp = person.get("keypoints") or {}
     for a, b in SKELETON:
         if kp.get(a) and kp.get(b):
@@ -143,49 +144,62 @@ def draw_person(frame, person, rep_manager=None):
                      (int(kp[a][0]), int(kp[a][1])),
                      (int(kp[b][0]), int(kp[b][1])),
                      color, 2)
-
-    # Keypoint dots
     for pt in kp.values():
         if pt:
             cv2.circle(frame, (int(pt[0]), int(pt[1])), 3, (0, 200, 255), -1)
 
-    # Name badge
-    badge = name
+    # Name badge (⚠ prefix if trainer alert)
+    badge = f"⚠ {name}" if trainer_alert else name
     (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
     cv2.rectangle(frame, (x1, y1 - th - 12), (x1 + tw + 8, y1), COLORS["name_bg"], -1)
     cv2.putText(frame, badge, (x1 + 4, y1 - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
 
-    # Exercise + stage tag
-    tag = f"{exercise.upper()} | {stage}  [{exercise}:{per_ex_reps}  total:{reps}]"
+    # Exercise tag line: exercise | stage | ✅N ❌N acc%
+    acc_str = f"  acc:{accuracy:.0f}%" if accuracy is not None else ""
+    tag = (f"{exercise.upper()} | {stage}  "
+           f"[{exercise}:{per_ex_reps}  ✅{correct} ❌{incorrect}{acc_str}]")
     cv2.putText(frame, tag, (x1, y2 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
-    # Feedback text
-    if feedback:
-        cv2.putText(frame, feedback, (x1, y2 + 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+    # Coaching feedback — use last_form_feedback so it persists between reps
+    display_fb  = feedback if feedback else last_form_fb
+    fb_color    = SEV_COLORS.get(last_form_sev, (0, 200, 255))
+    if "go again" in display_fb.lower() or "ready" in display_fb.lower():
+        fb_color = (0, 200, 255)   # neutral cyan for stage messages
+    if display_fb:
+        cv2.putText(frame, display_fb, (x1, y2 + 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, fb_color, 2)
 
-    # Big rep number (per-exercise count is more useful while exercising)
+    # Form score line
+    if prediction is not None:
+        pred_color = COLORS["correct"] if prediction == "correct" else COLORS["incorrect"]
+        pred_label = f"Form: {prediction.upper()}"
+        if form_score is not None:
+            pred_label += f"  Score: {form_score}/100"
+        cv2.putText(frame, pred_label, (x1, y2 + 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, pred_color, 2)
+
+    # Big rep number
     cv2.putText(frame, str(per_ex_reps),
                 (x1 + 6, y1 + 65),
                 cv2.FONT_HERSHEY_SIMPLEX, 2.2, color, 4)
 
-    # Angle readouts
-    elbow = angles.get("elbow") or 0
-    knee  = angles.get("knee")  or 0
+    # Angle readouts (top-right of box) — includes back angle now
+    elbow = angles.get("elbow")      or 0
+    knee  = angles.get("knee")       or 0
     body  = angles.get("body_angle") or 0
-    cv2.putText(frame, f"E:{elbow:.0f} K:{knee:.0f} B:{body:.0f}",
-                (x2 - 110, y1 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
+    back  = angles.get("back_angle") or 0
+    cv2.putText(frame, f"E:{elbow:.0f} K:{knee:.0f} B:{body:.0f} Bk:{back:.0f}",
+                (x2 - 170, y1 + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
 
 def draw_hud(frame, fps, paused, attended_today, persons):
-    """Draw top HUD bar and bottom attendance strip."""
+    """Top HUD bar + bottom attendance strip."""
     h, w = frame.shape[:2]
 
     cv2.rectangle(frame, (0, 0), (w, 50), (15, 15, 15), -1)
-
     cv2.putText(frame, f"FPS:{fps:.0f}",
                 (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     cv2.putText(frame, f"People:{len(persons)}",
@@ -211,20 +225,16 @@ def draw_hud(frame, fps, paused, attended_today, persons):
 
 def main():
     print("=" * 60)
-    print("  SmartGym AI — Starting up")
+    print("  SmartGym AI v3 — Starting up")
     print("=" * 60)
 
-    # ── Init all modules ──────────────────────────────────────────
     cam       = VideoStream(source=config.CAMERA_INDEX)
     tracker   = PersonTracker()
     linker    = IdentityLinker()
     estimator = PoseEstimator()
     rep_mgr   = RepCounterManager(default_exercise="pushup")
-
-    # FIX: always pass rep_manager so exercise switches notify the counter
     ex_det    = ExerciseDetectorManager(rep_manager=rep_mgr)
 
-    # Optional: attendance
     attendance = None
     if AttendanceTracker:
         try:
@@ -232,20 +242,18 @@ def main():
         except Exception as e:
             print(f"[Main] AttendanceTracker init failed: {e}")
 
-    # Optional: database
     db = None
     if DBHandler:
         try:
             db = DBHandler()
         except Exception as e:
-            print(f"[Main] DB not available: {e} — continuing without DB logging.")
+            print(f"[Main] DB not available: {e} — continuing without DB.")
 
     cam.start()
     print("[Main] Warming up camera...")
     time.sleep(2)
     print("\n[Main] ✅ All modules ready. Starting pipeline...\n")
 
-    # ── State ─────────────────────────────────────────────────────
     fps_start      = time.time()
     fps_count      = 0
     fps_display    = 0.0
@@ -257,7 +265,6 @@ def main():
 
     cv2.namedWindow("SmartGym AI", cv2.WINDOW_NORMAL)
 
-    # ── Main loop ─────────────────────────────────────────────────
     while True:
         ret, frame = cam.read()
         if not ret or frame is None:
@@ -274,18 +281,18 @@ def main():
         elif key == ord("r"):
             rep_mgr.counters.clear()
             ex_det.detectors.clear()
-            print("[Main] Rep counters + detectors reset.")
+            print("[Main] Reset all counters + detectors.")
         elif key == ord("s"):
             snapshot_count += 1
             fname = f"snapshot_{snapshot_count:03d}.jpg"
             cv2.imwrite(fname, frame)
-            print(f"[Main] Snapshot saved: {fname}")
+            print(f"[Main] Snapshot: {fname}")
         elif key == ord("p"):
             rep_mgr.set_exercise_for_all("pushup")
-            print("[Main] Forced: pushup mode for all")
+            print("[Main] Forced: pushup for all")
         elif key == ord("k"):
             rep_mgr.set_exercise_for_all("squat")
-            print("[Main] Forced: squat mode for all")
+            print("[Main] Forced: squat for all")
         elif (cv2.getWindowProperty("SmartGym AI", cv2.WND_PROP_VISIBLE) < 1
               and fps_count > 30):
             break
@@ -297,20 +304,17 @@ def main():
 
         fps_count += 1
 
-        # ── Pipeline ──────────────────────────────────────────────
-
-        # Step 1: Detect + track (BoT-SORT — single call)
+        # Step 1: Detect + track
         tracked = tracker.update(frame)
 
         # Step 2: Face identification
         identified = linker.update(frame, tracked)
 
-        # Step 3: Migrate exercise detector keys + mark attendance
+        # Step 3: Migrate detector keys + attendance
         for person in identified:
             name     = person.get("name", "Unknown")
             track_id = person.get("track_id")
             if name != "Unknown":
-                # FIX: migrate detector from "tid_X" → name to preserve history
                 if track_id is not None:
                     ex_det.migrate_unknown_to_name(track_id, name)
 
@@ -328,21 +332,17 @@ def main():
                     except Exception:
                         pass
 
-        # Step 4: Pose estimation — attach angles to every person
+        # Step 4: Pose estimation
         with_angles = []
         for person in identified:
             p = dict(person)
             p["angles"] = estimator.extract(person.get("keypoints") or {})
             with_angles.append(p)
 
-        # Step 5: Exercise detection (auto pushup/squat/standing)
+        # Step 5: Exercise detection
         with_exercise = ex_det.update(with_angles)
 
-        # FIX: exercise-switch notification is handled INSIDE ExerciseDetectorManager
-        # via its rep_manager reference. Do NOT duplicate it here — would cause
-        # switch_exercise() to fire twice and reset smoothers unnecessarily.
-
-        # Step 6: Rep counting
+        # Step 6: Rep counting + ML prediction
         results = rep_mgr.update(with_exercise)
 
         # Step 7: Database logging
@@ -382,7 +382,7 @@ def main():
                             exercise   = exercise,
                             rep_number = st["rep_count"],
                             angles     = person.get("bottom_angles", {}),
-                            form_score = None,
+                            form_score = person.get("form_score"),  # FIX 3
                         )
                         db.update_session_reps(
                             session_id = session_ids[sess_key],
@@ -407,7 +407,7 @@ def main():
         draw_hud(frame, fps_display, paused, attended_today, results)
         cv2.imshow("SmartGym AI", frame)
 
-    # ── Shutdown ──────────────────────────────────────────────────
+    # ── Shutdown ──────────────────────────────────────────────────────────────
     print("\n[Main] Shutting down...")
 
     if db:
@@ -431,20 +431,40 @@ def main():
     summary = rep_mgr.get_summary()
     if summary:
         for key, stats in summary.items():
-            per_ex = stats.get("per_exercise_reps", {})
-            lines  = []
+            per_ex    = stats.get("per_exercise_reps", {})
+            accuracy  = stats.get("form_accuracy")
+            alert     = stats.get("trainer_alert", False)
+            avg_score = stats.get("avg_form_score")
+            alert_tag = "  ⚠ TRAINER ALERT" if alert else ""
+
+            print(f"\n  {stats['name']:12} | Total reps: {stats['reps']}"
+                  f"  ✅{stats.get('correct_reps',0)} ❌{stats.get('incorrect_reps',0)}"
+                  f"  acc:{f'{accuracy:.0f}%' if accuracy is not None else 'n/a'}"
+                  f"{alert_tag}")
+
             for ex, count in per_ex.items():
                 sk = f"{stats['name']}_{ex}"
                 st = session_stats.get(sk, {})
                 bd = st.get("best_depth", 0.0)
                 av = ((st["total_depth"] / st["rep_count"])
                       if st.get("rep_count") else 0.0)
-                lines.append(f"{ex}: {count} reps  best={bd:.0f}°  avg={av:.0f}°")
-            if not lines:
-                lines = [f"{stats['exercise']}: {stats['reps']} reps"]
-            print(f"  {stats['name']:12} | Total: {stats['reps']} reps")
-            for line in lines:
-                print(f"    {line}")
+                score_str = f"  avg_score={avg_score}/100" if avg_score else ""
+                print(f"    {ex}: {count} reps  best={bd:.0f}°  avg={av:.0f}°{score_str}")
+
+            # Per-rep breakdown
+            per_rep = stats.get("per_rep_results", [])
+            if per_rep:
+                print(f"\n    Per-rep breakdown:")
+                for r in per_rep:
+                    icon      = "✅" if r.get("prediction") == "correct" else "❌"
+                    score_str = f"  score={r['score']}" if r.get("score") is not None else ""
+                    a         = r.get("angles", {})
+                    angle_str = (f"  [E:{a.get('elbow',0)} K:{a.get('knee',0)} "
+                                 f"H:{a.get('hip',0)} B:{a.get('body',0)} Bk:{a.get('back',0)}]")
+                    print(f"      Rep {r['rep']:2d}  {icon}  {r['feedback']}"
+                          f"{score_str}{angle_str}")
+
+            print(f"\n    → {'Posture needs work — consider trainer review' if alert else 'Great workout!'}")
     else:
         print("  No exercise data recorded.")
 

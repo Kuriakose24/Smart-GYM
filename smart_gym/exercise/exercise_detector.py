@@ -1,51 +1,49 @@
 """
-exercise/exercise_detector.py  (v7 — horizontal keypoint dropout fix)
-----------------------------------------------------------------------
-ROOT CAUSE of pushup not counting (from log):
+exercise/exercise_detector.py  (v9 — re-entry reset fix)
+----------------------------------------------------------
+CHANGES vs v8:
 
-    [ExerciseDetector] Kuriakose: 'unknown' → 'pushup'
-    [ExerciseDetector] Kuriakose: 'pushup' → 'unknown' (no signal for 20 frames)
+FIX 1 — Detector history reset on person re-entry
+    PROBLEM: When a known person (e.g. Nikson) leaves the frame and
+    re-enters, their ExerciseDetector still exists in self.detectors
+    with stale angle history from their previous exercise session.
+    If they left doing pushups and re-enter to do squats, the old
+    pushup knee/body/elbow values in the 15-frame history window
+    dilute the squat signal — the detector keeps outputting "pushup"
+    or "unknown" instead of confirming "squat".
 
-When a person lies horizontal for a pushup, YOLO frequently loses the
-shoulder and/or hip keypoints because they're compressed/occluded at
-ground level. This means pose_estimator can't compute body_angle, so:
+    FIX: migrate_unknown_to_name() now always resets the detector:
+      - First entry (tid_X → name): reset after migrating
+      - Re-entry (tid_X seen but name already exists): reset existing
+        named detector and discard the tid_X detector
 
-    body_angle = None  →  _body_history never updated
-    body_avg   = 0.0   (default when history is empty)
-    body_avg > 50      → FALSE  →  pushup signal never fires
-    exit_count climbs to 20  →  kicked out of "pushup"
+    The reset() method clears all history deques, last_body_avg,
+    candidate state, and exit count — giving a completely fresh
+    detection window on every re-entry.
 
-TWO FIXES:
+FIX 2 — current exercise state also reset on re-entry
+    Previously reset() only cleared history/candidate but left
+    self.current intact. On re-entry this meant the detector could
+    immediately return the old exercise ("pushup") on the first frame
+    before any new history was built, because the hysteresis block
+    for "same exercise" fires before the history check.
 
-FIX 1 — body_avg default when history empty = LAST KNOWN value, not 0.0
-    Once confirmed as pushup, the body IS horizontal. If keypoints drop
-    out, we should assume the body is still horizontal (person didn't
-    teleport to standing). Use a "last valid body_avg" field that only
-    updates when body_angle data is actually available.
+    reset() now also sets self.current = "unknown" so the person
+    must earn their exercise label from scratch each entry.
 
-FIX 2 — When CONFIRMED in pushup, elbow movement alone sustains the state
-    If current = "pushup" AND elbow_var > 8 (arms moving), treat that
-    as a pushup signal even without body_angle. This covers the common
-    case where YOLO tracks the arms well but drops hip/shoulder keypoints
-    when the person is horizontal.
-
-FIX 3 — EXIT_N raised from 20 → 30 for pushup specifically
-    Pushup sets are slow. A person at the top of a pushup (arms extended,
-    body still horizontal) has low elbow variance and body_avg may be
-    unreliable. 30 frames gives more tolerance between reps.
+All v8 fixes preserved:
+    ENTER_N=3, history warmup=2, "standing" neutral in hysteresis.
 """
-
-import sys
-import os
+import sys, os
 from collections import deque
-
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 
-ENTER_N        = 8    # frames of signal to CONFIRM entering an exercise
-EXIT_N_SQUAT   = 20   # frames of absence to EXIT squat
-EXIT_N_PUSHUP  = 30   # frames of absence to EXIT pushup (longer — keypoint dropout)
+# ── Tunable constants ─────────────────────────────────────────────────────────
+ENTER_N        = 3    # confirm exercise in ~0.2s at 15 FPS
+EXIT_N_SQUAT   = 20   # frames of no-signal before exiting squat
+EXIT_N_PUSHUP  = 30   # frames of no-signal before exiting pushup
 HISTORY_WINDOW = 15
 
 
@@ -69,14 +67,13 @@ class ExerciseDetector:
         self._body_history  = deque(maxlen=HISTORY_WINDOW)
         self._hdrop_history = deque(maxlen=HISTORY_WINDOW)
 
-        # FIX 1: last known body_avg — used when body_angle drops out
+        # Last known body_avg — reused when keypoints drop out horizontally
         self._last_body_avg = None
 
         print(f"[ExerciseDetector] Created for '{name}'")
 
     @property
     def _exit_n(self):
-        """Different exit patience depending on current exercise."""
         return EXIT_N_PUSHUP if self.current == "pushup" else EXIT_N_SQUAT
 
     def update(self, angles):
@@ -88,22 +85,24 @@ class ExerciseDetector:
 
     def _apply_hysteresis(self, detected):
         if self.current == "unknown":
-            if detected != "unknown" and detected == self._candidate:
-                self._candidate_count += 1
-                if self._candidate_count >= ENTER_N:
-                    print(f"[ExerciseDetector] {self.name}: 'unknown' → '{detected}'")
-                    self.current          = detected
-                    self._exit_count      = 0
-                    self._candidate_count = ENTER_N
-            else:
-                self._candidate       = detected
-                self._candidate_count = 1 if detected != "unknown" else 0
+            if detected not in ("unknown", "standing"):
+                if detected == self._candidate:
+                    self._candidate_count += 1
+                    if self._candidate_count >= ENTER_N:
+                        print(f"[ExerciseDetector] {self.name}: 'unknown' → '{detected}'")
+                        self.current          = detected
+                        self._exit_count      = 0
+                        self._candidate_count = ENTER_N
+                else:
+                    self._candidate       = detected
+                    self._candidate_count = 1
+            # "standing" is neutral — don't reset candidate, don't increment
+            # (allows squat candidate to accumulate right after standing signal)
 
         else:
             exit_n = self._exit_n
 
             if detected == self.current or detected == "standing":
-                # Still exercising or standing between reps → reset exit
                 self._exit_count = 0
 
             elif detected == "unknown":
@@ -117,7 +116,7 @@ class ExerciseDetector:
                     self._candidate_count = 0
 
             else:
-                # A different exercise is being signalled
+                # Different exercise signalled
                 if detected != self._candidate:
                     self._candidate       = detected
                     self._candidate_count = 1
@@ -140,11 +139,11 @@ class ExerciseDetector:
         hip_drop   = angles.get("_hip_drop_ratio", None)
 
         if elbow      is not None: self._elbow_history.append(elbow)
-        if knee        is not None: self._knee_history.append(knee)
-        if body_angle  is not None: self._body_history.append(body_angle)
-        if hip_drop    is not None: self._hdrop_history.append(hip_drop)
+        if knee       is not None: self._knee_history.append(knee)
+        if body_angle is not None: self._body_history.append(body_angle)
+        if hip_drop   is not None: self._hdrop_history.append(hip_drop)
 
-        if len(self._knee_history) < 5:
+        if len(self._knee_history) < 2:
             return "unknown"
 
         elbow_avg = (sum(self._elbow_history) / len(self._elbow_history)
@@ -155,29 +154,27 @@ class ExerciseDetector:
         elbow_var = self._variance(self._elbow_history)
         knee_var  = self._variance(self._knee_history)
 
-        # FIX 1: use last known body_avg if current frame has no body_angle data
+        # Use last known body_avg when keypoints drop out (pushup horizontal)
         if self._body_history:
             body_avg = sum(self._body_history) / len(self._body_history)
-            self._last_body_avg = body_avg          # save for dropout frames
+            self._last_body_avg = body_avg
         elif self._last_body_avg is not None:
-            body_avg = self._last_body_avg          # reuse last known value
+            body_avg = self._last_body_avg
         else:
-            body_avg = 0.0                          # truly no data yet
+            body_avg = 0.0
 
-        # ── PUSHUP ──────────────────────────────────────────────────────────
-        # Primary signal: body horizontal
+        # ── PUSHUP ────────────────────────────────────────────────────────────
         if body_avg > config.EXERCISE_PUSHUP_BODY_MIN:
             if elbow_avg < 125 and knee_avg > 145:
                 return "pushup"
             if elbow_var > 15 and knee_avg > 140:
                 return "pushup"
 
-        # FIX 2: Secondary signal when confirmed pushup + elbow moving
-        # Covers keypoint-dropout frames during horizontal position
+        # Secondary: confirmed pushup + elbow moving (covers keypoint dropout)
         if self.current == "pushup" and elbow_var > 8:
             return "pushup"
 
-        # ── SQUAT ───────────────────────────────────────────────────────────
+        # ── SQUAT ─────────────────────────────────────────────────────────────
         if body_avg < config.EXERCISE_SQUAT_BODY_MAX:
             if is_front and hdrop_avg is not None and hdrop_avg < 0.65:
                 return "squat"
@@ -186,7 +183,7 @@ class ExerciseDetector:
             if knee_var > 20 and knee_avg < 160:
                 return "squat"
 
-        # ── STANDING ────────────────────────────────────────────────────────
+        # ── STANDING ──────────────────────────────────────────────────────────
         if (knee_avg  > config.EXERCISE_STANDING_KNEE_MIN
                 and elbow_avg > 140
                 and body_avg  < 30):
@@ -208,6 +205,12 @@ class ExerciseDetector:
         return min(self._candidate_count / ENTER_N, 1.0)
 
     def reset(self):
+        """
+        Full reset — called on person re-entry so stale history from a
+        previous exercise session doesn't bleed into the new session.
+        Clears all angle history, resets hysteresis state, AND resets
+        self.current to "unknown" so the person must re-earn their label.
+        """
         self._elbow_history.clear()
         self._knee_history.clear()
         self._hip_history.clear()
@@ -217,6 +220,7 @@ class ExerciseDetector:
         self._candidate       = "unknown"
         self._candidate_count = 0
         self._exit_count      = 0
+        self.current          = "unknown"   # FIX 2: was missing — reset exercise label too
 
 
 class ExerciseDetectorManager:
@@ -226,7 +230,8 @@ class ExerciseDetectorManager:
             print("[ExerciseDetectorManager] ⚠ rep_manager is None — "
                   "exercise-switch notifications won't reach RepCounter.")
         self.detectors = {}
-        print("[ExerciseDetectorManager] v7 ready — horizontal keypoint dropout fix.")
+        print(f"[ExerciseDetectorManager] v9 ready — ENTER_N={ENTER_N}  "
+              f"exit squat={EXIT_N_SQUAT}  pushup={EXIT_N_PUSHUP}")
 
     def update(self, tracked_with_angles):
         results = []
@@ -267,14 +272,47 @@ class ExerciseDetectorManager:
         }
 
     def migrate_unknown_to_name(self, track_id, name):
+        """
+        Called from main.py every frame once a track ID is identified.
+
+        Two cases handled:
+
+        Case A — First entry (tid_X → name, name not yet in detectors):
+            Migrate the tid_X detector to the name key, then reset it.
+            The tid_X detector may have been building history as "Unknown"
+            which could be from a different person or a partial signal.
+            Reset gives a clean slate under the confirmed name.
+
+        Case B — Re-entry (tid_X seen, but name already exists in detectors):
+            The person left and came back with a new track ID.
+            Their old named detector has stale history from the previous
+            exercise session — discard tid_X detector and reset the
+            existing named detector so they re-earn their exercise label.
+            THIS IS THE MAIN FIX for the Nikson squat-not-counting bug.
+        """
         old_key = f"tid_{track_id}"
+
         if old_key in self.detectors and name not in self.detectors:
+            # Case A: first confirmed identity for this track
             self.detectors[name] = self.detectors.pop(old_key)
             self.detectors[name].name = name
-            print(f"[ExerciseDetectorManager] Migrated: '{old_key}' → '{name}'")
+            self.detectors[name].reset()
+            print(f"[ExerciseDetectorManager] Migrated + reset: '{old_key}' → '{name}'")
+
+        elif old_key in self.detectors and name in self.detectors:
+            # Case B: person re-entered with a new track ID
+            # Discard the new tid_X detector, reset the existing named one
+            del self.detectors[old_key]
+            self.detectors[name].reset()
+            print(f"[ExerciseDetectorManager] Re-entry detected — reset detector for '{name}'")
+
+        elif name not in self.detectors:
+            # Edge case: name appeared without a tid_ entry (shouldn't normally happen)
+            self.detectors[name] = ExerciseDetector(name=name)
+            print(f"[ExerciseDetectorManager] Created fresh detector for '{name}'")
 
 
-# ── Test ──────────────────────────────────────────────────────────────────────
+# ── Standalone test ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import cv2
     import time
@@ -285,9 +323,10 @@ if __name__ == "__main__":
     from exercise.rep_counter     import RepCounterManager
 
     print("=" * 60)
-    print("  Exercise Detector v7 -- press Q to quit")
-    print(f"  Enter={ENTER_N}  |  Exit squat={EXIT_N_SQUAT}  pushup={EXIT_N_PUSHUP}")
-    print("  Pushup: elbow movement sustains state even if YOLO drops body kps")
+    print(f"  Exercise Detector v9 -- press Q to quit")
+    print(f"  ENTER_N={ENTER_N}  Exit squat={EXIT_N_SQUAT}  pushup={EXIT_N_PUSHUP}")
+    print("  Leave frame and re-enter doing a different exercise")
+    print("  → new exercise should be detected cleanly")
     print("=" * 60)
 
     cam       = VideoStream(source=config.CAMERA_INDEX)
@@ -350,14 +389,13 @@ if __name__ == "__main__":
                              (int(kp[b][0]), int(kp[b][1])),
                              color, 2)
 
-            e  = angles.get("elbow",      0) or 0
-            k  = angles.get("knee",       0) or 0
-            b  = angles.get("body_angle") 
+            e    = angles.get("elbow",      0) or 0
+            k    = angles.get("knee",       0) or 0
+            b    = angles.get("body_angle")
             bstr = f"{b:.0f}" if b is not None else "N/A"
             det    = ex_det.detectors.get("Test")
             exit_c = det._exit_count if det else 0
             exit_n = det._exit_n if det else EXIT_N_SQUAT
-            ev = self._variance(det._elbow_history) if det else 0  # won't work outside class
 
             for i, line in enumerate([
                 "Test",
@@ -380,16 +418,16 @@ if __name__ == "__main__":
             fps_start = time.time()
 
         h, w = frame.shape[:2]
-        cv2.putText(frame, f"FPS:{fps_disp:.0f}  v7",
-                    (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2)
+        cv2.putText(frame, f"FPS:{fps_disp:.0f}  v9  ENTER_N={ENTER_N}",
+                    (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
         cv2.putText(frame, "Q to quit",
-                    (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 1)
+                    (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
 
-        cv2.imshow("SmartGym - Exercise Detector v7", frame)
+        cv2.imshow("SmartGym - Exercise Detector v9", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q") or key == 27:
             break
-        if cv2.getWindowProperty("SmartGym - Exercise Detector v7",
+        if cv2.getWindowProperty("SmartGym - Exercise Detector v9",
                                   cv2.WND_PROP_VISIBLE) < 1:
             break
 
